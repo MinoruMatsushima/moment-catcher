@@ -80,7 +80,83 @@ function processFolder_(folder, config, processed) {
     }
   }
 
+  // FR-1: MP4（録画ファイル）を検知して audio_triggers/ へ Push
+  const mp4Files = folder.getFilesByType(MimeType.VIDEO_MP4);
+  while (mp4Files.hasNext()) {
+    const mp4 = mp4Files.next();
+    if (shouldProcess_(mp4, processed)) {
+      const transcriptId = findMatchingTranscriptId_(folder, mp4.getName());
+      pushAudioTrigger_(mp4, transcriptId, config);
+      markProcessed_(mp4.getId(), processed);
+      count++;
+    }
+  }
+
   return count;
+}
+
+// ─── 同フォルダ内の対応する文字起こし Doc を探す ─────────────────────────────
+
+function findMatchingTranscriptId_(folder, mp4Name) {
+  // MP4 ファイル名から拡張子を除いた会議名を取得
+  // 例: "2026-02-23 15:30 Weekly Sync.mp4" → "2026-02-23 15:30 Weekly Sync"
+  const baseName = mp4Name.replace(/\.mp4$/i, '').trim();
+
+  const docFiles = folder.getFilesByType(MimeType.GOOGLE_DOCS);
+  while (docFiles.hasNext()) {
+    const doc = docFiles.next();
+    const docName = doc.getName().trim();
+    // 部分一致で照合（Google Meet は文字起こし Doc に会議名を使う）
+    if (docName.includes(baseName) || baseName.includes(docName)) {
+      return doc.getId();
+    }
+  }
+  return null;
+}
+
+// ─── audio_triggers/ に JSON トリガーをPush ───────────────────────────────────
+
+function pushAudioTrigger_(mp4File, transcriptFileId, config) {
+  const datePart   = formatDate_(mp4File.getDateCreated());
+  const safeName   = mp4File.getName().replace(/[^\w\-]/g, '_').replace(/\.mp4$/i, '');
+  const githubPath = 'audio_triggers/' + datePart + '_' + safeName + '.json';
+
+  const payload = JSON.stringify({
+    audio_file_id    : mp4File.getId(),
+    audio_file_name  : mp4File.getName(),
+    transcript_file_id: transcriptFileId || null,
+    created_at       : new Date().toISOString(),
+  }, null, 2);
+
+  const apiUrl = 'https://api.github.com/repos/'
+    + config.owner + '/' + config.repo + '/contents/' + githubPath;
+
+  const existing = fetchExistingSha_(apiUrl, config.token);
+
+  const body = {
+    message : 'feat: add audio trigger ' + githubPath,
+    content : Utilities.base64Encode(payload, Utilities.Charset.UTF_8),
+    branch  : 'main',
+  };
+  if (existing) body.sha = existing;
+
+  const resp = UrlFetchApp.fetch(apiUrl, {
+    method      : 'put',
+    contentType : 'application/json',
+    headers     : {
+      Authorization: 'Bearer ' + config.token,
+      Accept       : 'application/vnd.github+json',
+    },
+    payload         : JSON.stringify(body),
+    muteHttpExceptions: true,
+  });
+
+  const code = resp.getResponseCode();
+  if (code === 200 || code === 201) {
+    Logger.log('Audio trigger Push 成功: %s', githubPath);
+  } else {
+    Logger.log('Audio trigger Push 失敗: %s (%s)\n%s', githubPath, code, resp.getContentText());
+  }
 }
 
 // ─── 処理対象判定（未処理 かつ 直近24時間以内に更新） ────────────────────────

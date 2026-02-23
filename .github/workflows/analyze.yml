@@ -3,12 +3,17 @@ name: MomentCatcher — Analyze Transcript
 on:
   push:
     paths:
-      - "transcripts/**"
+      - "transcripts/**"     # FR-0: 文字起こしファイル
+      - "audio_triggers/**"  # FR-1: 音声トリガー JSON
 
 jobs:
-  analyze:
+  # ─── FR-0: 文字起こしのみで解析 ──────────────────────────────────────────────
+  analyze-fr0:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    if: |
+      contains(toJson(github.event.commits.*.modified), 'transcripts/') ||
+      contains(toJson(github.event.commits.*.added), 'transcripts/')
 
     steps:
       - name: Checkout repository
@@ -27,19 +32,131 @@ jobs:
       - name: Detect changed transcript files
         id: changed
         run: |
-          # Push で変更されたファイルを改行区切りで取得
           FILES=$(git diff --name-only HEAD~1 HEAD -- 'transcripts/**' | tr '\n' ' ')
           echo "files=${FILES}" >> "$GITHUB_OUTPUT"
           echo "Changed files: ${FILES}"
 
-      - name: Run analyze.py
+      - name: Run analyze.py (FR-0)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           for FILE in ${{ steps.changed.outputs.files }}; do
             if [ -f "$FILE" ]; then
-              echo "Analyzing: $FILE"
-              python scripts/analyze.py "$FILE"
+              echo "Analyzing (FR-0): $FILE"
+              python scripts/analyze.py --mode fr0 "$FILE"
             fi
+          done
+
+  # ─── FR-1: 音声スパイク付き解析 ───────────────────────────────────────────────
+  analyze-fr1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: |
+      contains(toJson(github.event.commits.*.modified), 'audio_triggers/') ||
+      contains(toJson(github.event.commits.*.added), 'audio_triggers/')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install anthropic requests librosa google-auth google-auth-httplib2 google-api-python-client
+
+      - name: Detect changed audio trigger files
+        id: triggers
+        run: |
+          FILES=$(git diff --name-only HEAD~1 HEAD -- 'audio_triggers/**' | grep '\.json$' | tr '\n' ' ')
+          echo "files=${FILES}" >> "$GITHUB_OUTPUT"
+          echo "Trigger files: ${FILES}"
+
+      - name: Process each audio trigger
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
+        run: |
+          for TRIGGER in ${{ steps.triggers.outputs.files }}; do
+            if [ ! -f "$TRIGGER" ]; then
+              echo "Trigger file not found: $TRIGGER"
+              continue
+            fi
+
+            echo "=== Processing trigger: $TRIGGER ==="
+
+            # トリガー JSON から Drive ファイル ID を取得
+            AUDIO_FILE_ID=$(python -c "import json,sys; d=json.load(open('$TRIGGER')); print(d['audio_file_id'])")
+            AUDIO_FILE_NAME=$(python -c "import json,sys; d=json.load(open('$TRIGGER')); print(d['audio_file_name'])")
+            TRANSCRIPT_FILE_ID=$(python -c "import json,sys; d=json.load(open('$TRIGGER')); print(d.get('transcript_file_id') or '')")
+
+            echo "Audio: $AUDIO_FILE_NAME ($AUDIO_FILE_ID)"
+            echo "Transcript ID: $TRANSCRIPT_FILE_ID"
+
+            # Google Drive から MP4 をダウンロード
+            echo "$GOOGLE_SERVICE_ACCOUNT_KEY" > /tmp/sa_key.json
+            python - <<'PYEOF'
+import json, os, sys
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
+sa_key_path = "/tmp/sa_key.json"
+file_id     = os.environ["AUDIO_FILE_ID"]
+output_path = "/tmp/meeting.mp4"
+
+creds = Credentials.from_service_account_file(
+    sa_key_path,
+    scopes=["https://www.googleapis.com/auth/drive.readonly"],
+)
+service = build("drive", "v3", credentials=creds)
+
+request = service.files().get_media(fileId=file_id)
+with open(output_path, "wb") as f:
+    downloader = MediaIoBaseDownload(f, request)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+        print(f"Download {int(status.progress() * 100)}%", file=sys.stderr)
+
+print(f"Downloaded to {output_path}", file=sys.stderr)
+PYEOF
+            export AUDIO_FILE_ID="$AUDIO_FILE_ID"
+
+            # ffmpeg で WAV 抽出（モノラル、22050Hz）
+            ffmpeg -y -i /tmp/meeting.mp4 -ac 1 -ar 22050 /tmp/meeting.wav
+            echo "WAV extracted"
+
+            # acoustic_engine.py でスパイク検出
+            python scripts/acoustic_engine.py /tmp/meeting.wav --output /tmp/spikes.json
+            echo "Spikes:"
+            cat /tmp/spikes.json
+
+            # 対応する文字起こしファイルを transcripts/ から照合
+            TRIGGER_BASE=$(basename "$TRIGGER" .json)
+            TRANSCRIPT_FILE=$(ls transcripts/${TRIGGER_BASE}*.txt 2>/dev/null | head -1)
+            if [ -z "$TRANSCRIPT_FILE" ]; then
+              # 日付プレフィックスで再試行
+              DATE_PREFIX=$(echo "$TRIGGER_BASE" | grep -oP '^\d{4}-\d{2}-\d{2}')
+              TRANSCRIPT_FILE=$(ls transcripts/${DATE_PREFIX}*.txt 2>/dev/null | head -1)
+            fi
+
+            if [ -n "$TRANSCRIPT_FILE" ] && [ -f "$TRANSCRIPT_FILE" ]; then
+              echo "Using transcript: $TRANSCRIPT_FILE"
+              python scripts/analyze.py --mode fr1 --spikes /tmp/spikes.json "$TRANSCRIPT_FILE"
+            else
+              echo "No transcript found. Skipping Claude analysis."
+            fi
+
+            # 一時ファイルを削除
+            rm -f /tmp/meeting.mp4 /tmp/meeting.wav /tmp/spikes.json /tmp/sa_key.json
           done
