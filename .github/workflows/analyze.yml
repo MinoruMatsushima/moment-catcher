@@ -1,0 +1,45 @@
+name: MomentCatcher — Analyze Transcript
+
+on:
+  push:
+    paths:
+      - "transcripts/**"
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # 直前コミットとの差分を取るために 2 コミット分取得
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install anthropic requests
+
+      - name: Detect changed transcript files
+        id: changed
+        run: |
+          # Push で変更されたファイルを改行区切りで取得
+          FILES=$(git diff --name-only HEAD~1 HEAD -- 'transcripts/**' | tr '\n' ' ')
+          echo "files=${FILES}" >> "$GITHUB_OUTPUT"
+          echo "Changed files: ${FILES}"
+
+      - name: Run analyze.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          for FILE in ${{ steps.changed.outputs.files }}; do
+            if [ -f "$FILE" ]; then
+              echo "Analyzing: $FILE"
+              python scripts/analyze.py "$FILE"
+            fi
+          done
