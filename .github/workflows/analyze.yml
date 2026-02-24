@@ -103,34 +103,7 @@ jobs:
             echo "Transcript ID: $TRANSCRIPT_FILE_ID"
 
             # Google Drive から MP4 をダウンロード
-            echo "$GOOGLE_SERVICE_ACCOUNT_KEY" > /tmp/sa_key.json
-            python - <<'PYEOF'
-import json, os, sys
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-
-sa_key_path = "/tmp/sa_key.json"
-file_id     = os.environ["AUDIO_FILE_ID"]
-output_path = "/tmp/meeting.mp4"
-
-creds = Credentials.from_service_account_file(
-    sa_key_path,
-    scopes=["https://www.googleapis.com/auth/drive.readonly"],
-)
-service = build("drive", "v3", credentials=creds)
-
-request = service.files().get_media(fileId=file_id)
-with open(output_path, "wb") as f:
-    downloader = MediaIoBaseDownload(f, request)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-        print(f"Download {int(status.progress() * 100)}%", file=sys.stderr)
-
-print(f"Downloaded to {output_path}", file=sys.stderr)
-PYEOF
-            export AUDIO_FILE_ID="$AUDIO_FILE_ID"
+            python scripts/download_from_drive.py "$AUDIO_FILE_ID" /tmp/meeting.mp4
 
             # ffmpeg で WAV 抽出（モノラル、22050Hz）
             ffmpeg -y -i /tmp/meeting.mp4 -ac 1 -ar 22050 /tmp/meeting.wav
