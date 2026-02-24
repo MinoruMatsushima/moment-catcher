@@ -34,6 +34,7 @@ function getConfig_() {
 function syncTranscriptToGithub() {
   const config     = getConfig_();
   const processed  = getProcessedIds_();
+  pruneProcessedIds_(processed);  // 30日以上前のエントリを削除
   const folders    = ['マイレコーディング', 'My Recordings'];
 
   let pushCount = 0;
@@ -61,9 +62,8 @@ function processFolder_(folder, config, processed) {
     if (shouldProcess_(file, processed)) {
       const text = exportDocAsText_(file);
       if (text) {
-        pushToGithub_(file, text, config);
-        markProcessed_(file.getId(), processed);
-        count++;
+        const ok = pushToGithub_(file, text, config);
+        if (ok) { markProcessed_(file.getId(), processed); count++; }
       }
     }
   }
@@ -74,9 +74,8 @@ function processFolder_(folder, config, processed) {
     const file = txtFiles.next();
     if (shouldProcess_(file, processed)) {
       const text = file.getBlob().getDataAsString('UTF-8');
-      pushToGithub_(file, text, config);
-      markProcessed_(file.getId(), processed);
-      count++;
+      const ok = pushToGithub_(file, text, config);
+      if (ok) { markProcessed_(file.getId(), processed); count++; }
     }
   }
 
@@ -86,9 +85,8 @@ function processFolder_(folder, config, processed) {
     const mp4 = mp4Files.next();
     if (shouldProcess_(mp4, processed)) {
       const transcriptId = findMatchingTranscriptId_(folder, mp4.getName());
-      pushAudioTrigger_(mp4, transcriptId, config);
-      markProcessed_(mp4.getId(), processed);
-      count++;
+      const ok = pushAudioTrigger_(mp4, transcriptId, config);
+      if (ok) { markProcessed_(mp4.getId(), processed); count++; }
     }
   }
 
@@ -118,8 +116,7 @@ function findMatchingTranscriptId_(folder, mp4Name) {
 
 function pushAudioTrigger_(mp4File, transcriptFileId, config) {
   const datePart   = formatDate_(mp4File.getDateCreated());
-  const safeName   = mp4File.getName().replace(/[^\w\-]/g, '_').replace(/\.mp4$/i, '');
-  const githubPath = 'audio_triggers/' + datePart + '_' + safeName + '.json';
+  const githubPath = 'audio_triggers/' + datePart + '_' + mp4File.getId().slice(0, 8) + '.json';
 
   const payload = JSON.stringify({
     audio_file_id    : mp4File.getId(),
@@ -154,8 +151,10 @@ function pushAudioTrigger_(mp4File, transcriptFileId, config) {
   const code = resp.getResponseCode();
   if (code === 200 || code === 201) {
     Logger.log('Audio trigger Push 成功: %s', githubPath);
+    return true;
   } else {
     Logger.log('Audio trigger Push 失敗: %s (%s)\n%s', githubPath, code, resp.getContentText());
+    return false;
   }
 }
 
@@ -191,8 +190,7 @@ function exportDocAsText_(file) {
 
 function pushToGithub_(file, content, config) {
   const datePart   = formatDate_(file.getDateCreated());
-  const safeName   = file.getName().replace(/[^\w\-]/g, '_');
-  const githubPath = 'transcripts/' + datePart + '_' + safeName + '.txt';
+  const githubPath = 'transcripts/' + datePart + '_' + file.getId().slice(0, 8) + '.txt';
 
   const apiUrl = 'https://api.github.com/repos/'
     + config.owner + '/' + config.repo + '/contents/' + githubPath;
@@ -221,8 +219,10 @@ function pushToGithub_(file, content, config) {
   const code = resp.getResponseCode();
   if (code === 200 || code === 201) {
     Logger.log('Push 成功: %s', githubPath);
+    return true;
   } else {
     Logger.log('Push 失敗: %s (%s)\n%s', githubPath, code, resp.getContentText());
+    return false;
   }
 }
 
@@ -254,6 +254,23 @@ function markProcessed_(fileId, processed) {
   PropertiesService.getScriptProperties().setProperty(
     'PROCESSED_IDS', JSON.stringify(processed)
   );
+}
+
+function pruneProcessedIds_(processed) {
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  let pruned = 0;
+  for (const [id, iso] of Object.entries(processed)) {
+    if (new Date(iso) < thirtyDaysAgo) {
+      delete processed[id];
+      pruned++;
+    }
+  }
+  if (pruned > 0) {
+    PropertiesService.getScriptProperties().setProperty(
+      'PROCESSED_IDS', JSON.stringify(processed)
+    );
+    Logger.log('PROCESSED_IDS から %s 件を削除しました', pruned);
+  }
 }
 
 // ─── 日付フォーマット ─────────────────────────────────────────────────────────
